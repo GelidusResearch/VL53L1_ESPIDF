@@ -1,11 +1,11 @@
 /**
  * i2c_platform_esp.c
- * 
- * I2C device interface for the 
+ *
+ * I2C device interface for the
  * Espressif Internet-of-Things (IoT) Development Framework ESP-IDF
  *
  * I2C_Master is the global I2C interface shared by all devices
- * 
+ *
  * (c) 2021 by David Asher
  * https://github.com/david-asher
  * https://www.linkedin.com/in/davidasher/
@@ -13,35 +13,84 @@
  */
 
 #include "i2c_platform_esp.h"
+#include <stdio.h>
+#include <stdlib.h>
+#include <string.h>
 
 typedef struct {
-
-    i2c_port_t 		  port; 
-    gpio_num_t 		  pin_sda; 
-    gpio_num_t 		  pin_scl; 
-    uint32_t   		  freq;
-    uint8_t           dev_address;
-    i2c_cmd_handle_t  cmd_handle;
-
+    i2c_port_t port;
+    gpio_num_t pin_sda;
+    gpio_num_t pin_scl;
+    uint32_t freq;
+    uint8_t dev_address;
+    i2c_rw_t read_write;
+    i2c_master_bus_handle_t bus_handle;
+    i2c_master_dev_handle_t device_handles[128];
+    uint8_t *write_buffer;
+    size_t write_len;
+    size_t write_cap;
+    uint8_t *read_buffer;
+    size_t read_len;
+    bool transaction_open;
 } I2C_Master_t;
 
 I2C_Master_t *I2C_Master = (I2C_Master_t *) NULL;
 
+static bool i2c_ensure_write_capacity(size_t needed)
+{
+    if (I2C_Master->write_cap >= needed) {
+        return true;
+    }
+    size_t new_cap = I2C_Master->write_cap == 0 ? 16 : I2C_Master->write_cap;
+    while (new_cap < needed) {
+        new_cap *= 2;
+    }
+    uint8_t *new_buffer = (uint8_t *) realloc(I2C_Master->write_buffer, new_cap);
+    if (new_buffer == NULL) {
+        return false;
+    }
+    I2C_Master->write_buffer = new_buffer;
+    I2C_Master->write_cap = new_cap;
+    return true;
+}
+
+static i2c_master_dev_handle_t i2c_get_or_create_device(uint8_t address)
+{
+    if (address >= 128 || I2C_Master == NULL || I2C_Master->bus_handle == NULL) {
+        return NULL;
+    }
+    if (I2C_Master->device_handles[address] != NULL) {
+        return I2C_Master->device_handles[address];
+    }
+
+    i2c_device_config_t dev_cfg = {
+        .dev_addr_length = I2C_ADDR_BIT_LEN_7,
+        .device_address = address,
+        .scl_speed_hz = I2C_Master->freq,
+        .scl_wait_us = 0,
+        .flags.disable_ack_check = 0,
+    };
+
+    i2c_master_dev_handle_t handle = NULL;
+    esp_err_t err = i2c_master_bus_add_device(I2C_Master->bus_handle, &dev_cfg, &handle);
+    if (err != ESP_OK) {
+        return NULL;
+    }
+    I2C_Master->device_handles[address] = handle;
+    return handle;
+}
+
 void i2c_scan()
 {
     printf("\r\nI2C device scan: ");
+    if (I2C_Master == NULL || I2C_Master->bus_handle == NULL) {
+        i2c_init();
+    }
     for (uint8_t i = 1; i < 127; i++)
     {
-        int ret;
-        uint8_t test_address = i << 1;
-        i2c_cmd_handle_t cmd = i2c_cmd_link_create();
-        ESP_ERROR_CHECK( i2c_master_start(cmd) );
-        ESP_ERROR_CHECK( i2c_master_write_byte(cmd, test_address | I2C_MASTER_WRITE, 1) );
-        ESP_ERROR_CHECK( i2c_master_stop(cmd) );
-        ret = i2c_master_cmd_begin(I2C_NUM_0, cmd, 100 / portTICK_PERIOD_MS);
-        i2c_cmd_link_delete(cmd);
+        esp_err_t ret = i2c_master_probe(I2C_Master->bus_handle, i, 100);
         if (ret != ESP_OK) continue;
-        printf("0x%02X | ", test_address );
+        printf("0x%02X | ", i );
     }
     printf( "\r\n" );
 }
@@ -49,35 +98,45 @@ void i2c_scan()
 I2C_Master_t *i2c_master_setup()
 {
     I2C_Master_t *new_master = (I2C_Master_t *) malloc( sizeof( I2C_Master_t ) );
+    memset(new_master, 0, sizeof(I2C_Master_t));
     new_master->port = I2C_DEFAULT_PORT;
-    new_master->pin_sda = I2C_DEFAULT_SDA; 
+    new_master->pin_sda = I2C_DEFAULT_SDA;
     new_master->pin_scl = I2C_DEFAULT_SCL;
     new_master->freq = I2C_DEFAULT_FREQ;
     new_master->dev_address = I2C_NO_DEVICE;
-    new_master->cmd_handle = NULL;
+    new_master->read_write = I2C_WRITE;
+    new_master->bus_handle = NULL;
+    new_master->write_buffer = NULL;
+    new_master->write_len = 0;
+    new_master->write_cap = 0;
+    new_master->read_buffer = NULL;
+    new_master->read_len = 0;
+    new_master->transaction_open = false;
     return new_master;
 }
 
 void i2c_get_config( i2c_port_t *port, gpio_num_t *pin_sda, gpio_num_t *pin_scl, uint32_t *freq )
 {
     *port = I2C_Master->port;
-    *pin_sda = I2C_Master->pin_sda; 
+    *pin_sda = I2C_Master->pin_sda;
     *pin_scl = I2C_Master->pin_scl;
     *freq = I2C_Master->freq;
 }
 
 void i2c_init_driver()
 {
-    i2c_config_t conf;
-    conf.mode = I2C_MODE_MASTER;
-    conf.sda_io_num = I2C_Master->pin_sda;
-    conf.sda_pullup_en = GPIO_PULLUP_ENABLE;
-    conf.scl_io_num = I2C_Master->pin_scl;
-    conf.scl_pullup_en = GPIO_PULLUP_ENABLE;
-    conf.master.clk_speed = I2C_Master->freq;
-    conf.clk_flags = I2C_SCLK_SRC_FLAG_FOR_NOMAL;
-    ESP_ERROR_CHECK( i2c_param_config( I2C_Master->port, &conf ) );
-    ESP_ERROR_CHECK( i2c_driver_install( I2C_Master->port, conf.mode, 0, 0, 0 ) );
+    i2c_master_bus_config_t conf = {
+        .i2c_port = I2C_Master->port,
+        .sda_io_num = I2C_Master->pin_sda,
+        .scl_io_num = I2C_Master->pin_scl,
+        .clk_source = I2C_CLK_SRC_DEFAULT,
+        .glitch_ignore_cnt = 7,
+        .intr_priority = 0,
+        .trans_queue_depth = 4,
+        .flags.enable_internal_pullup = 1,
+        .flags.allow_pd = 0,
+    };
+    ESP_ERROR_CHECK(i2c_new_master_bus(&conf, &I2C_Master->bus_handle));
 }
 
 void i2c_init_config( i2c_port_t port, gpio_num_t pin_sda, gpio_num_t pin_scl, uint32_t freq )
@@ -85,23 +144,35 @@ void i2c_init_config( i2c_port_t port, gpio_num_t pin_sda, gpio_num_t pin_scl, u
     if ( I2C_Master != (I2C_Master_t *) NULL ) return;
     I2C_Master = i2c_master_setup();
     I2C_Master->port = port;
-    I2C_Master->pin_sda = pin_sda; 
+    I2C_Master->pin_sda = pin_sda;
     I2C_Master->pin_scl = pin_scl;
     I2C_Master->freq = freq;
     i2c_init_driver();
 }
 
-void i2c_init() 
+void i2c_init()
 {
     if ( I2C_Master != (I2C_Master_t *) NULL ) return;
     I2C_Master = i2c_master_setup();
     i2c_init_driver();
-    i2c_filter_enable(I2C_Master->port, 7);
 }
 
-void i2c_remove() 
+void i2c_remove()
 {
-    ESP_ERROR_CHECK( i2c_driver_delete( I2C_Master->port ) );
+    if (I2C_Master == NULL) {
+        return;
+    }
+    for (int i = 0; i < 128; i++) {
+        if (I2C_Master->device_handles[i] != NULL) {
+            ESP_ERROR_CHECK(i2c_master_bus_rm_device(I2C_Master->device_handles[i]));
+            I2C_Master->device_handles[i] = NULL;
+        }
+    }
+    if (I2C_Master->bus_handle != NULL) {
+        ESP_ERROR_CHECK(i2c_del_master_bus(I2C_Master->bus_handle));
+        I2C_Master->bus_handle = NULL;
+    }
+    free(I2C_Master->write_buffer);
     free( I2C_Master );
     I2C_Master = (I2C_Master_t *) NULL;
 }
@@ -120,62 +191,102 @@ void i2c_upgrade( uint32_t upgrade_freq )
 
 bool i2c_start( uint8_t i2c_device_address, i2c_rw_t read_write )
 {
-    // be thread-safe
-    if ( I2C_Master->cmd_handle == (i2c_cmd_handle_t) NULL ) {
-        // I2C_MASTER was not processing a command, so start a new one
+    if (I2C_Master == NULL) {
+        i2c_init();
+    }
+    if (!I2C_Master->transaction_open) {
+        I2C_Master->transaction_open = true;
+        I2C_Master->write_len = 0;
+        I2C_Master->read_buffer = NULL;
+        I2C_Master->read_len = 0;
         I2C_Master->dev_address = i2c_device_address;
-        I2C_Master->cmd_handle = i2c_cmd_link_create();
-    }
-    else if ( I2C_Master->dev_address != i2c_device_address ) {
-        // check for the case where a second thread is attempting to start a command on a second device
-        // while a first device is processing a command, and reject it
+    } else if (I2C_Master->dev_address != i2c_device_address) {
         return false;
-        // start() may legitimately be called multiple times, e.g. to write a command then read the result
     }
-    ESP_ERROR_CHECK( i2c_master_start( I2C_Master->cmd_handle ) );
-    ESP_ERROR_CHECK( i2c_master_write_byte( I2C_Master->cmd_handle, I2C_Master->dev_address | read_write, ACK_CHECK_EN ) );
+    I2C_Master->read_write = read_write;
+    if (i2c_get_or_create_device(i2c_device_address) == NULL) {
+        return false;
+    }
     return true;
 }
 
 size_t i2c_write_byte( uint8_t data_byte_out )
 {
-    if ( I2C_Master->cmd_handle == (i2c_cmd_handle_t) NULL ) return 0;
-    ESP_ERROR_CHECK( i2c_master_write_byte( I2C_Master->cmd_handle, data_byte_out, ACK_CHECK_EN ) );
+    if ( I2C_Master == NULL || !I2C_Master->transaction_open || I2C_Master->read_write != I2C_WRITE ) return 0;
+    if (!i2c_ensure_write_capacity(I2C_Master->write_len + 1)) {
+        return 0;
+    }
+    I2C_Master->write_buffer[I2C_Master->write_len++] = data_byte_out;
     return 1;
 }
 
 size_t i2c_write( uint8_t *pByteBuffer, size_t NumByteToWrite )
 {
-    uint16_t byte_index;
-    if ( I2C_Master->cmd_handle == (i2c_cmd_handle_t) NULL ) return 0;
-    // Note: Needed to use i2c_master_write_byte as i2c_master_write will not expect an ack after each byte
-    while ( NumByteToWrite-- > 0 )
-    {
-        ESP_ERROR_CHECK( i2c_master_write_byte( I2C_Master->cmd_handle, *pByteBuffer++, ACK_CHECK_EN ) );
+    if ( I2C_Master == NULL || !I2C_Master->transaction_open || I2C_Master->read_write != I2C_WRITE ) return 0;
+    if (!i2c_ensure_write_capacity(I2C_Master->write_len + NumByteToWrite)) {
+        return 0;
     }
-    return byte_index;
+    memcpy(&I2C_Master->write_buffer[I2C_Master->write_len], pByteBuffer, NumByteToWrite);
+    I2C_Master->write_len += NumByteToWrite;
+    return NumByteToWrite;
 }
 
 uint8_t i2c_read_byte()
 {
     uint8_t byteBuffer = 0;
-    ESP_ERROR_CHECK( i2c_master_read_byte( I2C_Master->cmd_handle, &byteBuffer, I2C_MASTER_LAST_NACK ) );
+    if (i2c_read(&byteBuffer, 1) != 1) {
+        return 0;
+    }
     return byteBuffer;
 }
 
 size_t i2c_read( uint8_t *pByteBuffer, size_t NumByteToRead )
 {
-    ESP_ERROR_CHECK( i2c_master_read( I2C_Master->cmd_handle, pByteBuffer, NumByteToRead, I2C_MASTER_LAST_NACK ) );
+    if ( I2C_Master == NULL || !I2C_Master->transaction_open ) return 0;
+    I2C_Master->read_write = I2C_READ;
+    I2C_Master->read_buffer = pByteBuffer;
+    I2C_Master->read_len = NumByteToRead;
     return NumByteToRead;
 }
 
 esp_err_t i2c_transmit()
 {
-    ESP_ERROR_CHECK( i2c_master_stop( I2C_Master->cmd_handle ) );
-    esp_err_t i2c_error = i2c_master_cmd_begin(I2C_Master->port, I2C_Master->cmd_handle, 1000 / portTICK_PERIOD_MS);
-    i2c_cmd_link_delete( I2C_Master->cmd_handle );
+    if (I2C_Master == NULL || !I2C_Master->transaction_open || I2C_Master->dev_address == I2C_NO_DEVICE) {
+        return ESP_ERR_INVALID_STATE;
+    }
+
+    i2c_master_dev_handle_t dev = i2c_get_or_create_device(I2C_Master->dev_address);
+    if (dev == NULL) {
+        return ESP_ERR_INVALID_STATE;
+    }
+
+    esp_err_t i2c_error;
+    if (I2C_Master->read_len > 0) {
+        if (I2C_Master->write_len > 0) {
+            i2c_error = i2c_master_transmit_receive(dev,
+                                                    I2C_Master->write_buffer,
+                                                    I2C_Master->write_len,
+                                                    I2C_Master->read_buffer,
+                                                    I2C_Master->read_len,
+                                                    1000);
+        } else {
+            i2c_error = i2c_master_receive(dev,
+                                           I2C_Master->read_buffer,
+                                           I2C_Master->read_len,
+                                           1000);
+        }
+    } else {
+        i2c_error = i2c_master_transmit(dev,
+                                        I2C_Master->write_buffer,
+                                        I2C_Master->write_len,
+                                        1000);
+    }
+
     I2C_Master->dev_address = I2C_NO_DEVICE;
-    I2C_Master->cmd_handle = (i2c_cmd_handle_t) NULL;
+    I2C_Master->read_write = I2C_WRITE;
+    I2C_Master->read_buffer = NULL;
+    I2C_Master->read_len = 0;
+    I2C_Master->write_len = 0;
+    I2C_Master->transaction_open = false;
     return i2c_error;
 }
-

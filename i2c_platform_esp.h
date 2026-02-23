@@ -1,11 +1,11 @@
 /**
  * i2c_platform_esp.h
- * 
- * I2C device interface for the 
+ *
+ * I2C device interface for the
  * Espressif Internet-of-Things (IoT) Development Framework ESP-IDF
  *
  * I2C_Master is the global I2C interface shared by all devices
- * 
+ *
  * (c) 2021 by David Asher
  * https://github.com/david-asher
  * https://www.linkedin.com/in/davidasher/
@@ -20,9 +20,10 @@ extern "C"
 {
 #endif
 
-#include "driver/i2c.h"
+#include "driver/i2c_master.h"
 #include "driver/gpio.h"
 #include "esp_err.h"
+#include "freertos/FreeRTOS.h"
 
 #define I2C_DEFAULT_PORT    (I2C_NUM_0)
 #define I2C_DEFAULT_SDA     (GPIO_NUM_23)
