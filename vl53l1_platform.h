@@ -1,6 +1,6 @@
 /**
  * vl53l1_platform.h
- * 
+ *
  * Platform-specific interface functions for the ST VL53L1 family of
  * time-of-flight laser ranging sensors, specific implementation for the
  * Espressif Internet-of-Things (IoT) Development Framework ESP-IDF
@@ -9,11 +9,11 @@
  * https://github.com/david-asher
  * https://www.linkedin.com/in/davidasher/
  * This code is licensed under MIT license, see LICENSE.txt for details
- * 
+ *
  * @file  vl53l1_platform.h
  * @brief Platform-specific interface functions for the ST VL53L1 ToF ranging sensors on ESP-IDF
  */
- 
+
 #ifndef _VL53L1_PLATFORM_H_
 #define _VL53L1_PLATFORM_H_
 
@@ -24,8 +24,11 @@ extern "C"
 
 #include "VL53L1X_error_codes.h"
 #include "VL53L1X_register_map.h"
+
+#ifdef ESPIDF
 #include "i2c_platform_esp.h"
 #include "gpio_platform_esp.h"
+#endif
 
 #define VL53L1_I2C_ADDRESS          (0x52)      // default I2C address for VL53L1
 
